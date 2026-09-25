@@ -28,11 +28,26 @@ button, input, textarea { font: inherit; }
 .save-state.dirty i, .save-state.saving i { background: #f2bd4d; }
 .save-state.conflict i { background: #ff6b6b; }
 .file-input { display: none; }
-.network-banner, .conflict-banner { padding: 9px 22px; font-size: 13px; }
+.network-banner { padding: 9px 22px; font-size: 13px; }
 .network-banner.offline { color: #765c15; background: #fff3ce; border-bottom: 1px solid #f1d98f; }
-.conflict-banner { display: flex; align-items: center; justify-content: space-between; gap: 24px; color: #721c24; background: #fff0f0; border-bottom: 1px solid #f3b8b8; }
-.conflict-banner strong { margin-right: 12px; }
-.conflict-actions { display: flex; gap: 8px; }
+.merge-intro { margin: 0 0 12px; color: #46546b; font-size: 13px; line-height: 1.6; }
+.merge-list { max-height: 52vh; overflow: auto; display: grid; gap: 10px; padding-right: 4px; }
+.merge-item { padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: #fbfcfe; }
+.merge-item > header { display: flex; align-items: baseline; gap: 10px; margin-bottom: 8px; }
+.merge-item > header code { color: #66748a; font-size: 11px; white-space: nowrap; }
+.merge-item > header b { overflow: hidden; color: #1d2b41; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
+.merge-note { margin: 4px 0 8px; color: #ad6610; font-size: 12px; }
+.merge-fields { width: 100%; margin-bottom: 8px; border-collapse: collapse; }
+.merge-fields th, .merge-fields td { padding: 6px 8px; border: 1px solid #e6ebf2; font-size: 12px; text-align: left; vertical-align: top; }
+.merge-fields thead th { color: #46546b; background: #f2f5fa; font-size: 11px; }
+.merge-fields tbody th { width: 90px; color: #647187; background: #f8fafc; font-weight: 600; }
+.merge-fields td { color: #31405a; word-break: break-word; }
+.merge-fields td.picked { background: #eef4ff; box-shadow: inset 0 0 0 1px #b9cdf2; }
+.merge-pick { display: flex; gap: 18px; }
+.merge-effect { margin-left: 6px; color: #98a3b4; font-size: 11px; }
+.merge-footer { display: flex; align-items: center; gap: 4px; }
+.merge-footer .el-button { margin-left: 0; }
+.merge-spacer { flex: 1; }
 .workspace { height: calc(100vh - 78px); min-height: 720px; display: grid; grid-template-columns: 258px minmax(640px, 1fr) 360px; overflow: hidden; }
 .panel { overflow: auto; background: rgba(255,255,255,.86); }
 .left-panel { border-right: 1px solid var(--line); padding: 18px 14px; }

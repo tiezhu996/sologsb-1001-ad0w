@@ -3,11 +3,14 @@ import type { Cue, EditorDocument, Locale, Snapshot } from '../types'
 import { loadDocument, saveDocument } from '../utils/db'
 import { makeId } from '../utils/id'
 import { parseScript, parseSrt, toSrt } from '../utils/subtitle'
+import { applyMergeChoice, planMerge, type CueMergeConflict, type MergeChoice, type MergePlan } from '../utils/merge'
 import { translate, type MessageKey } from '../i18n'
 
 const DOCUMENT_ID = 'subtitle-dubbing-document'
 let saveTimer: ReturnType<typeof setTimeout> | undefined
 let channel: BroadcastChannel | undefined
+let merging = false
+let pendingMerge: { plan: MergePlan; base: Cue[]; theirs: EditorDocument } | null = null
 
 const cloneCues = (cues: Cue[]): Cue[] => JSON.parse(JSON.stringify(cues)) as Cue[]
 const plainDocument = (document: EditorDocument): EditorDocument => JSON.parse(JSON.stringify(document)) as EditorDocument
@@ -58,6 +61,10 @@ export const useEditorStore = defineStore('subtitle-editor', {
     tabId: makeId('tab'),
     lastSeenRevision: 0,
     mutationSerial: 0,
+    baseDocument: null as EditorDocument | null,
+    mergeConflicts: [] as CueMergeConflict[],
+    mergeAutoCount: 0,
+    mergeNotice: '',
     past: [] as { label: string; cues: Cue[]; selectedCueId: string | null }[],
     future: [] as { label: string; cues: Cue[]; selectedCueId: string | null }[],
   }),
@@ -82,10 +89,12 @@ export const useEditorStore = defineStore('subtitle-editor', {
       const stored = await loadDocument(DOCUMENT_ID)
       if (stored) {
         this.document = stored
+        this.baseDocument = plainDocument(stored)
         this.lastSeenRevision = stored.revision
       } else {
         const saved = await saveDocument(plainDocument(this.document))
         this.document = saved
+        this.baseDocument = plainDocument(saved)
         this.lastSeenRevision = saved.revision
       }
       this.initialized = true
@@ -95,14 +104,15 @@ export const useEditorStore = defineStore('subtitle-editor', {
           const message = event.data as { type: string; tabId: string; revision: number; documentId: string }
           if (message.type !== 'document-updated' || message.tabId === this.tabId || message.documentId !== DOCUMENT_ID) return
           if (message.revision <= this.lastSeenRevision) return
-          if (this.saveState === 'dirty' || this.saveState === 'saving' || this.conflict) {
-            this.conflict = true
-            this.saveState = 'conflict'
+          if (this.conflict || merging) return
+          if (this.saveState === 'dirty' || this.saveState === 'saving') {
+            void this.attemptMerge()
             return
           }
           const latest = await loadDocument(DOCUMENT_ID)
           if (latest && latest.revision > this.lastSeenRevision) {
             this.document = latest
+            this.baseDocument = plainDocument(latest)
             this.lastSeenRevision = latest.revision
             this.saveState = 'saved'
           }
@@ -120,6 +130,7 @@ export const useEditorStore = defineStore('subtitle-editor', {
       this.markChanged('language', true)
     },
     commit(label: string, mutate: (cues: Cue[]) => void, nextSelection?: string | null) {
+      if (this.conflict) return
       const before = cloneCues(this.document.cues)
       const working = cloneCues(this.document.cues)
       mutate(working)
@@ -149,6 +160,7 @@ export const useEditorStore = defineStore('subtitle-editor', {
         this.document.revision = next.revision
         this.document.updatedAt = next.updatedAt
         this.lastSeenRevision = next.revision
+        this.baseDocument = plainDocument(next)
         if (serial === this.mutationSerial) {
           this.saveState = 'saved'
         } else {
@@ -157,8 +169,7 @@ export const useEditorStore = defineStore('subtitle-editor', {
         channel?.postMessage({ type: 'document-updated', tabId: this.tabId, revision: next.revision, documentId: DOCUMENT_ID })
       } catch (error) {
         if (error instanceof Error && error.message === 'REVISION_CONFLICT') {
-          this.conflict = true
-          this.saveState = 'conflict'
+          void this.attemptMerge()
         } else {
           this.saveState = 'dirty'
           console.error(label, error)
@@ -171,6 +182,69 @@ export const useEditorStore = defineStore('subtitle-editor', {
         }
       }
     },
+    async attemptMerge() {
+      if (merging || this.conflict || !this.initialized) return
+      merging = true
+      try {
+        for (;;) {
+          const serial = this.mutationSerial
+          const theirs = await loadDocument(DOCUMENT_ID)
+          if (!theirs || theirs.revision <= this.lastSeenRevision) {
+            this.conflict = false
+            this.mergeConflicts = []
+            pendingMerge = null
+            if (this.saveState === 'conflict' || this.saveState === 'saving') this.markChanged('resync')
+            return
+          }
+          if (serial !== this.mutationSerial) continue
+          const base = this.baseDocument ?? this.document
+          const plan = planMerge(base.cues, this.document.cues, theirs.cues)
+          if (!plan.conflicts.length) {
+            this.applyMerge(plan.cues, theirs, plan.theirChanges)
+            return
+          }
+          pendingMerge = { plan, base: cloneCues(base.cues), theirs: plainDocument(theirs) }
+          this.mergeAutoCount = plan.theirChanges
+          this.mergeConflicts = plan.conflicts
+          this.conflict = true
+          this.saveState = 'conflict'
+          return
+        }
+      } finally {
+        merging = false
+      }
+    },
+    applyMerge(cues: Cue[], theirs: EditorDocument, theirChanges: number, notice?: string) {
+      this.past.push({ label: 'merge-remote', cues: cloneCues(this.document.cues), selectedCueId: this.selectedCueId })
+      if (this.past.length > 60) this.past.shift()
+      this.future = []
+      this.document.cues = cloneCues(cues)
+      if (this.selectedCueId && !this.document.cues.some((cue) => cue.id === this.selectedCueId)) {
+        this.selectedCueId = this.document.cues[0]?.id ?? null
+      }
+      this.baseDocument = plainDocument(theirs)
+      this.lastSeenRevision = theirs.revision
+      this.document.revision = theirs.revision
+      this.conflict = false
+      this.mergeConflicts = []
+      this.mergeAutoCount = 0
+      pendingMerge = null
+      this.mergeNotice = notice ?? (theirChanges > 0 ? this.t('mergeAutoDone', { count: theirChanges }) : this.t('mergeSynced'))
+      this.markChanged('merge-remote')
+    },
+    async resolveMerge(choices: Record<string, MergeChoice>) {
+      const pending = pendingMerge
+      if (!pending) return
+      pendingMerge = null
+      const cues = cloneCues(pending.plan.cues)
+      for (const conflict of pending.plan.conflicts) {
+        applyMergeChoice(cues, pending.base, conflict, choices[conflict.cueId] ?? 'mine')
+      }
+      this.applyMerge(cues, pending.theirs, pending.plan.theirChanges, this.t('mergeDone'))
+    },
+    clearMergeNotice() {
+      this.mergeNotice = ''
+    },
     async keepMine() {
       try {
         this.saving = true
@@ -179,9 +253,19 @@ export const useEditorStore = defineStore('subtitle-editor', {
         const next = await saveDocument({ ...plainDocument(this.document), lastWriter: this.tabId }, expected)
         this.document.revision = next.revision
         this.lastSeenRevision = next.revision
+        this.baseDocument = plainDocument(next)
         this.conflict = false
+        this.mergeConflicts = []
+        pendingMerge = null
         this.saveState = 'saved'
         channel?.postMessage({ type: 'document-updated', tabId: this.tabId, revision: next.revision, documentId: DOCUMENT_ID })
+      } catch (error) {
+        if (error instanceof Error && error.message === 'REVISION_CONFLICT') {
+          this.conflict = false
+          this.mergeConflicts = []
+          pendingMerge = null
+          void this.attemptMerge()
+        }
       } finally {
         this.saving = false
       }
@@ -190,12 +274,16 @@ export const useEditorStore = defineStore('subtitle-editor', {
       const latest = await loadDocument(DOCUMENT_ID)
       if (!latest) return
       this.document = latest
+      this.baseDocument = plainDocument(latest)
       this.lastSeenRevision = latest.revision
       this.conflict = false
+      this.mergeConflicts = []
+      pendingMerge = null
       this.saveState = 'saved'
       this.selectedCueId = latest.cues[0]?.id ?? null
     },
     undo() {
+      if (this.conflict) return
       const entry = this.past.pop()
       if (!entry) return
       this.future.push({ label: entry.label, cues: cloneCues(this.document.cues), selectedCueId: this.selectedCueId })
@@ -204,6 +292,7 @@ export const useEditorStore = defineStore('subtitle-editor', {
       this.markChanged(`undo:${entry.label}`)
     },
     redo() {
+      if (this.conflict) return
       const entry = this.future.pop()
       if (!entry) return
       this.past.push({ label: entry.label, cues: cloneCues(this.document.cues), selectedCueId: this.selectedCueId })
@@ -290,6 +379,7 @@ export const useEditorStore = defineStore('subtitle-editor', {
       this.markChanged('snapshot', true)
     },
     restoreSnapshot(id: string) {
+      if (this.conflict) return
       const snapshot = this.document.snapshots.find((item) => item.id === id)
       if (!snapshot) return
       this.past.push({ label: 'restore-snapshot', cues: cloneCues(this.document.cues), selectedCueId: this.selectedCueId })
