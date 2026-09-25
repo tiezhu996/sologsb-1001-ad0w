@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
@@ -7,15 +7,26 @@ import {
   RefreshLeft, RefreshRight, Search, Unlock, UploadFilled,
 } from '@element-plus/icons-vue'
 import { useEditorStore } from './store/editor'
-import type { Cue, CueConflict } from './types'
+import type { Cue, CueConflict, CueMergeConflict, CueMergeField, MergeSide } from './types'
+import type { MessageKey } from './i18n'
 import { formatTime } from './utils/subtitle'
 
 const store = useEditorStore()
-const { document: project, selectedCue, selectedCueId, visibleCues, saveState, conflict, online, timelineZoom, actorFilter } = storeToRefs(store)
+const { document: project, selectedCue, selectedCueId, visibleCues, saveState, conflict, online, timelineZoom, actorFilter, pendingMerge } = storeToRefs(store)
 const fileInput = ref<HTMLInputElement>()
 const snapshotDialog = ref(false)
 const snapshotName = ref('')
 const search = ref('')
+const mergePicks = reactive<Record<string, MergeSide>>({})
+
+watch(pendingMerge, () => {
+  Object.keys(mergePicks).forEach((key) => delete mergePicks[key])
+})
+watch(() => store.mergeNotice, (text) => {
+  if (!text) return
+  ElMessage.success(text)
+  store.mergeNotice = ''
+})
 
 const filteredCues = computed(() => {
   const query = search.value.trim().toLowerCase()
@@ -32,6 +43,42 @@ const actorColor = (id: string) => project.value.actors.find((actor) => actor.id
 const actorName = (id: string) => project.value.actors.find((actor) => actor.id === id)?.name ?? '—'
 const statusLabel = (status: Cue['status']) => store.t(status)
 const statusType = (status: Cue['status']) => status === 'reviewed' ? 'success' : status === 'issue' ? 'danger' : 'info'
+
+const mergeFieldKeys: Record<CueMergeField, MessageKey> = {
+  start: 'start', end: 'end', source: 'source', target: 'target', actorId: 'actor',
+  speed: 'speed', termIds: 'termsUsed', status: 'status', locked: 'locked',
+}
+const mergeFieldLabel = (field: CueMergeField) => store.t(mergeFieldKeys[field])
+function mergeFieldValue(field: CueMergeField, value: unknown): string {
+  if (value === undefined || value === null) return '—'
+  if (field === 'actorId') return actorName(String(value))
+  if (field === 'status') return statusLabel(value as Cue['status'])
+  if (field === 'locked') return value ? store.t('locked') : store.t('unlock')
+  if (field === 'start' || field === 'end') return formatTime(Number(value))
+  if (field === 'termIds') {
+    const names = (value as string[]).map((id) => {
+      const term = project.value.terms.find((item) => item.id === id)
+      return term ? `${term.source}→${term.target}` : id
+    })
+    return names.join('、') || '—'
+  }
+  return String(value)
+}
+const mergeCueRef = (item: CueMergeConflict) => item.mineCue ?? item.theirsCue
+const mergeCueTime = (item: CueMergeConflict) => {
+  const cue = mergeCueRef(item)
+  return cue ? `${formatTime(cue.start)} → ${formatTime(cue.end)}` : ''
+}
+const minePickLabel = (item: CueMergeConflict) => item.mineDeleted ? store.t('keepDeleted') : store.t('pickMine')
+const theirsPickLabel = (item: CueMergeConflict) => item.mineDeleted ? store.t('restoreTheirs') : item.theirsDeleted ? store.t('deleteThisCue') : store.t('pickTheirs')
+const allMergePicked = computed(() => (pendingMerge.value?.conflicts ?? []).every((item) => mergePicks[item.cueId]))
+function pickAll(side: MergeSide) {
+  pendingMerge.value?.conflicts.forEach((item) => { mergePicks[item.cueId] = side })
+}
+function finishMerge() {
+  if (!allMergePicked.value) return
+  store.resolveMerge({ ...mergePicks })
+}
 
 function updateSelected(patch: Partial<Cue>, label = 'update-cue') {
   if (selectedCue.value) store.updateCue(selectedCue.value.id, patch, label)
@@ -91,6 +138,7 @@ function createSnapshot() {
   ElMessage.success(store.t('savedNow'))
 }
 function onKeydown(event: KeyboardEvent) {
+  if (store.pendingMerge) return
   const target = event.target as HTMLElement
   if (['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName) || target.isContentEditable) return
   const key = event.key.toLowerCase()
@@ -152,12 +200,13 @@ const handleOffline = () => setOnline(false)
 
     <div v-if="!online" class="network-banner offline">{{ store.t('offline') }}</div>
 
-    <div v-if="conflict" class="conflict-banner">
+    <div v-if="conflict && !pendingMerge" class="conflict-banner">
       <div>
         <strong>{{ store.t('conflictTitle') }}</strong>
         <span>{{ store.t('conflictBody') }}</span>
       </div>
       <div class="conflict-actions">
+        <el-button size="small" type="primary" @click="store.attemptMerge()">{{ store.t('retryMerge') }}</el-button>
         <el-button size="small" @click="store.loadLatest">{{ store.t('loadLatest') }}</el-button>
         <el-button size="small" type="danger" @click="store.keepMine">{{ store.t('keepMine') }}</el-button>
       </div>
@@ -316,6 +365,63 @@ const handleOffline = () => setOnline(false)
       <span><kbd>L</kbd> {{ store.t('shortcutLock') }}</span>
       <span><kbd>Ctrl/⌘ Z</kbd> {{ store.t('shortcutUndo') }}</span>
     </footer>
+
+    <el-dialog
+      :model-value="!!pendingMerge" :title="store.t('mergeTitle')" width="760px" class="merge-dialog"
+      :show-close="false" :close-on-click-modal="false" :close-on-press-escape="false"
+    >
+      <template v-if="pendingMerge">
+        <p class="merge-intro">{{ store.t('mergeIntro', { count: pendingMerge.conflicts.length }) }}</p>
+        <p class="merge-stats">{{ store.t('mergeAutoStats', { theirs: pendingMerge.tookTheirs, mine: pendingMerge.keptMine, blend: pendingMerge.blended }) }}</p>
+        <div class="merge-list">
+          <div v-for="(item, index) in pendingMerge.conflicts" :key="item.cueId" class="merge-item">
+            <div class="merge-item-head">
+              <span class="merge-item-title">
+                <b>#{{ index + 1 }}</b>
+                <code>{{ mergeCueTime(item) }}</code>
+                <template v-if="!item.mineDeleted && !item.theirsDeleted">
+                  <el-tag v-for="contest in item.contests" :key="contest.field" size="small" type="warning">{{ mergeFieldLabel(contest.field) }}</el-tag>
+                </template>
+              </span>
+              <el-radio-group :model-value="mergePicks[item.cueId]" size="small" @update:model-value="mergePicks[item.cueId] = $event as MergeSide">
+                <el-radio-button value="mine">{{ minePickLabel(item) }}</el-radio-button>
+                <el-radio-button value="theirs">{{ theirsPickLabel(item) }}</el-radio-button>
+              </el-radio-group>
+            </div>
+            <div v-if="item.mineDeleted || item.theirsDeleted" class="merge-deleted">
+              <p class="merge-note">{{ store.t(item.mineDeleted ? 'mergeDeletedByMe' : 'mergeDeletedByTheirs') }}</p>
+              <p class="source-text">{{ mergeCueRef(item)?.source }}</p>
+              <p class="target-text">{{ mergeCueRef(item)?.target || '—' }}</p>
+            </div>
+            <table v-else class="merge-fields">
+              <thead>
+                <tr><th /><th>{{ store.t('pickMine') }}</th><th>{{ store.t('pickTheirs') }}</th></tr>
+              </thead>
+              <tbody>
+                <tr v-for="contest in item.contests" :key="contest.field">
+                  <th>{{ mergeFieldLabel(contest.field) }}</th>
+                  <td :class="{ picked: mergePicks[item.cueId] === 'mine' }">{{ mergeFieldValue(contest.field, contest.mine) }}</td>
+                  <td :class="{ picked: mergePicks[item.cueId] === 'theirs' }">{{ mergeFieldValue(contest.field, contest.theirs) }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </template>
+      <template #footer>
+        <div class="merge-footer">
+          <div class="merge-footer-escape">
+            <el-button text type="danger" size="small" @click="store.loadLatest">{{ store.t('loadLatest') }}</el-button>
+            <el-button text size="small" @click="store.keepMine">{{ store.t('keepMine') }}</el-button>
+          </div>
+          <div class="merge-footer-actions">
+            <el-button size="small" @click="pickAll('mine')">{{ store.t('allMine') }}</el-button>
+            <el-button size="small" @click="pickAll('theirs')">{{ store.t('allTheirs') }}</el-button>
+            <el-button type="primary" :disabled="!allMergePicked" @click="finishMerge">{{ store.t('finishMerge') }}</el-button>
+          </div>
+        </div>
+      </template>
+    </el-dialog>
 
     <el-dialog v-model="snapshotDialog" :title="store.t('snapshot')" width="460px">
       <el-input v-model="snapshotName" :placeholder="store.t('newSnapshotName')" @keyup.enter="createSnapshot" />

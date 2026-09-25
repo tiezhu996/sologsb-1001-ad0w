@@ -1,7 +1,8 @@
 import { defineStore } from 'pinia'
-import type { Cue, EditorDocument, Locale, Snapshot } from '../types'
+import type { Cue, DocumentMergeResult, EditorDocument, Locale, MergeSide, PendingMerge, Snapshot } from '../types'
 import { loadDocument, saveDocument } from '../utils/db'
 import { makeId } from '../utils/id'
+import { applyMergePicks, mergeDocuments } from '../utils/merge'
 import { parseScript, parseSrt, toSrt } from '../utils/subtitle'
 import { translate, type MessageKey } from '../i18n'
 
@@ -58,6 +59,10 @@ export const useEditorStore = defineStore('subtitle-editor', {
     tabId: makeId('tab'),
     lastSeenRevision: 0,
     mutationSerial: 0,
+    baseDocument: null as EditorDocument | null,
+    merging: false,
+    pendingMerge: null as PendingMerge | null,
+    mergeNotice: '',
     past: [] as { label: string; cues: Cue[]; selectedCueId: string | null }[],
     future: [] as { label: string; cues: Cue[]; selectedCueId: string | null }[],
   }),
@@ -83,10 +88,12 @@ export const useEditorStore = defineStore('subtitle-editor', {
       if (stored) {
         this.document = stored
         this.lastSeenRevision = stored.revision
+        this.snapshotBase(stored)
       } else {
         const saved = await saveDocument(plainDocument(this.document))
         this.document = saved
         this.lastSeenRevision = saved.revision
+        this.snapshotBase(saved)
       }
       this.initialized = true
       if ('BroadcastChannel' in window) {
@@ -95,15 +102,16 @@ export const useEditorStore = defineStore('subtitle-editor', {
           const message = event.data as { type: string; tabId: string; revision: number; documentId: string }
           if (message.type !== 'document-updated' || message.tabId === this.tabId || message.documentId !== DOCUMENT_ID) return
           if (message.revision <= this.lastSeenRevision) return
-          if (this.saveState === 'dirty' || this.saveState === 'saving' || this.conflict) {
-            this.conflict = true
-            this.saveState = 'conflict'
+          if (this.merging || this.conflict) return
+          if (this.saveState === 'dirty' || this.saveState === 'saving') {
+            await this.attemptMerge()
             return
           }
           const latest = await loadDocument(DOCUMENT_ID)
           if (latest && latest.revision > this.lastSeenRevision) {
             this.document = latest
             this.lastSeenRevision = latest.revision
+            this.snapshotBase(latest)
             this.saveState = 'saved'
           }
         }
@@ -140,7 +148,7 @@ export const useEditorStore = defineStore('subtitle-editor', {
       }
     },
     async persist(label = 'autosave') {
-      if (!this.initialized || this.conflict || this.saveState === 'saving') return
+      if (!this.initialized || this.conflict || this.merging || this.saveState === 'saving') return
       const serial = this.mutationSerial
       this.saveState = 'saving'
       this.saving = true
@@ -149,6 +157,7 @@ export const useEditorStore = defineStore('subtitle-editor', {
         this.document.revision = next.revision
         this.document.updatedAt = next.updatedAt
         this.lastSeenRevision = next.revision
+        this.snapshotBase(this.document)
         if (serial === this.mutationSerial) {
           this.saveState = 'saved'
         } else {
@@ -157,18 +166,114 @@ export const useEditorStore = defineStore('subtitle-editor', {
         channel?.postMessage({ type: 'document-updated', tabId: this.tabId, revision: next.revision, documentId: DOCUMENT_ID })
       } catch (error) {
         if (error instanceof Error && error.message === 'REVISION_CONFLICT') {
-          this.conflict = true
-          this.saveState = 'conflict'
+          void this.attemptMerge()
         } else {
           this.saveState = 'dirty'
           console.error(label, error)
         }
       } finally {
         this.saving = false
-        if (this.saveState === 'dirty') {
+        if (this.saveState === 'dirty' && !this.merging) {
           if (saveTimer) clearTimeout(saveTimer)
           saveTimer = setTimeout(() => void this.persist(label), 700)
         }
+      }
+    },
+    snapshotBase(document: EditorDocument) {
+      this.baseDocument = plainDocument(document)
+    },
+    // 把合并结果写回文档，并压入撤销栈，合并这一步本身可以撤销。
+    applyMerge(result: DocumentMergeResult) {
+      this.past.push({ label: 'merge-remote', cues: cloneCues(this.document.cues), selectedCueId: this.selectedCueId })
+      if (this.past.length > 60) this.past.shift()
+      this.future = []
+      this.document.cues = result.cues
+      this.document.title = result.title
+      this.document.language = result.language
+      this.document.actors = result.actors
+      this.document.terms = result.terms
+      this.document.snapshots = result.snapshots
+      this.document.updatedAt = Date.now()
+      if (!result.cues.some((cue) => cue.id === this.selectedCueId)) {
+        this.selectedCueId = result.cues[0]?.id ?? null
+      }
+    },
+    async trySaveMerged(expectedRevision: number): Promise<'saved' | 'conflict' | 'error'> {
+      const serial = this.mutationSerial
+      this.saveState = 'saving'
+      this.saving = true
+      try {
+        const next = await saveDocument({ ...plainDocument(this.document), lastWriter: this.tabId }, expectedRevision)
+        this.document.revision = next.revision
+        this.document.updatedAt = next.updatedAt
+        this.lastSeenRevision = next.revision
+        this.snapshotBase(this.document)
+        this.saveState = serial === this.mutationSerial ? 'saved' : 'dirty'
+        channel?.postMessage({ type: 'document-updated', tabId: this.tabId, revision: next.revision, documentId: DOCUMENT_ID })
+        return 'saved'
+      } catch (error) {
+        if (error instanceof Error && error.message === 'REVISION_CONFLICT') return 'conflict'
+        this.saveState = 'dirty'
+        console.error('merge-save', error)
+        return 'error'
+      } finally {
+        this.saving = false
+      }
+    },
+    // 冲突时按条三方合并：以 baseDocument 为共同祖先，单边改动直接采用，
+    // 只有同一条台词两边都改过同一字段才列入 pendingMerge 让人逐条挑边。
+    async attemptMerge(): Promise<void> {
+      if (this.merging || !this.baseDocument) return
+      this.merging = true
+      if (saveTimer) clearTimeout(saveTimer)
+      try {
+        for (let round = 0; round < 3; round += 1) {
+          const theirs = await loadDocument(DOCUMENT_ID)
+          if (!theirs || theirs.revision <= this.lastSeenRevision) {
+            // 存储里的版本不比本页新（例如数据被回滚），停下自动保存，交给用户选择。
+            this.conflict = true
+            this.saveState = 'conflict'
+            return
+          }
+          const result = mergeDocuments(this.baseDocument, this.document, theirs)
+          if (result.conflicts.length) {
+            this.pendingMerge = { ...result, theirsCues: cloneCues(theirs.cues), theirsRevision: theirs.revision }
+            this.conflict = true
+            this.saveState = 'conflict'
+            return
+          }
+          this.applyMerge(result)
+          const outcome = await this.trySaveMerged(theirs.revision)
+          if (outcome === 'saved') {
+            this.mergeNotice = this.t('mergeAutoDone', { theirs: result.tookTheirs, mine: result.keptMine, blend: result.blended })
+            return
+          }
+          if (outcome !== 'conflict') return
+          // 合并期间对方又保存了新版本，基于最新版本重新合并。
+        }
+        this.conflict = true
+        this.saveState = 'conflict'
+      } finally {
+        this.merging = false
+        if (this.saveState === 'dirty' && !this.conflict) {
+          saveTimer = setTimeout(() => void this.persist('autosave'), 700)
+        }
+      }
+    },
+    async resolveMerge(picks: Record<string, MergeSide>) {
+      const pending = this.pendingMerge
+      if (!pending) return
+      const finalCues = applyMergePicks(pending.cues, pending.conflicts, picks, pending.theirsCues)
+      this.pendingMerge = null
+      this.conflict = false
+      this.applyMerge({ ...pending, cues: finalCues })
+      const outcome = await this.trySaveMerged(pending.theirsRevision)
+      if (outcome === 'saved') {
+        this.mergeNotice = this.t('mergeDone')
+      } else if (outcome === 'conflict') {
+        await this.attemptMerge()
+      } else if (this.saveState === 'dirty') {
+        saveTimer = setTimeout(() => void this.persist('autosave'), 700)
       }
     },
     async keepMine() {
@@ -179,7 +284,9 @@ export const useEditorStore = defineStore('subtitle-editor', {
         const next = await saveDocument({ ...plainDocument(this.document), lastWriter: this.tabId }, expected)
         this.document.revision = next.revision
         this.lastSeenRevision = next.revision
+        this.snapshotBase(this.document)
         this.conflict = false
+        this.pendingMerge = null
         this.saveState = 'saved'
         channel?.postMessage({ type: 'document-updated', tabId: this.tabId, revision: next.revision, documentId: DOCUMENT_ID })
       } finally {
@@ -191,7 +298,9 @@ export const useEditorStore = defineStore('subtitle-editor', {
       if (!latest) return
       this.document = latest
       this.lastSeenRevision = latest.revision
+      this.snapshotBase(latest)
       this.conflict = false
+      this.pendingMerge = null
       this.saveState = 'saved'
       this.selectedCueId = latest.cues[0]?.id ?? null
     },

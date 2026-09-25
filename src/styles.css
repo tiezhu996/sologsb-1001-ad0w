@@ -114,6 +114,25 @@ kbd { padding: 2px 5px; border: 1px solid #5a6981; border-radius: 4px; color: wh
 .snapshot-item { display: grid; grid-template-columns: 1fr auto auto; gap: 10px; align-items: center; padding: 10px 0; border-bottom: 1px solid #edf0f4; }
 .snapshot-item div { display: flex; flex-direction: column; gap: 3px; }
 .snapshot-item small, .snapshot-item span { color: #7b8799; font-size: 11px; }
+.merge-intro { margin: 0 0 4px; color: #33425a; font-size: 13px; font-weight: 600; }
+.merge-stats { margin: 0 0 12px; color: #7c8799; font-size: 12px; }
+.merge-list { max-height: 46vh; overflow: auto; display: grid; gap: 10px; padding-right: 4px; }
+.merge-item { padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: #fbfcfe; }
+.merge-item-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.merge-item-title { display: flex; align-items: center; gap: 8px; color: #46546b; font-size: 12px; }
+.merge-item-title code { color: #66748a; font-size: 10px; }
+.merge-fields { width: 100%; margin-top: 10px; border-collapse: collapse; font-size: 12px; }
+.merge-fields th, .merge-fields td { padding: 6px 8px; border: 1px solid #e6ebf3; text-align: left; vertical-align: top; }
+.merge-fields thead th { color: #7b8799; font-size: 11px; background: #f4f7fb; }
+.merge-fields tbody th { width: 90px; color: #647187; font-weight: 600; background: #f8fafc; }
+.merge-fields td { width: 50%; color: #2c3a52; word-break: break-word; }
+.merge-fields td.picked { background: #e8f2ff; box-shadow: inset 0 0 0 1px #9db9ed; font-weight: 600; }
+.merge-deleted { margin-top: 8px; padding: 8px 10px; border-radius: 8px; background: #fff7dd; }
+.merge-deleted .merge-note { margin: 0 0 4px; color: #735c16; font-size: 12px; font-weight: 600; }
+.merge-deleted .source-text { margin: 4px 0 2px; font-size: 13px; }
+.merge-deleted .target-text { font-size: 12px; }
+.merge-footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.merge-footer-actions { display: flex; align-items: center; gap: 8px; }
 @media (max-width: 1380px) {
   .workspace { grid-template-columns: 224px minmax(580px, 1fr) 330px; }
   .shortcut-bar { left: 224px; right: 330px; }

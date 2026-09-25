@@ -54,6 +54,47 @@ export interface CueConflict {
   message: string
 }
 
+export type MergeSide = 'mine' | 'theirs'
+
+export type CueMergeField = 'start' | 'end' | 'source' | 'target' | 'actorId' | 'speed' | 'termIds' | 'status' | 'locked'
+
+export interface FieldContest {
+  field: CueMergeField
+  base: unknown
+  mine: unknown
+  theirs: unknown
+}
+
+export interface CueMergeConflict {
+  cueId: string
+  mineDeleted: boolean
+  theirsDeleted: boolean
+  mineCue: Cue | null
+  theirsCue: Cue | null
+  contests: FieldContest[]
+}
+
+export interface CueMergeResult {
+  cues: Cue[]
+  conflicts: CueMergeConflict[]
+  tookTheirs: number
+  keptMine: number
+  blended: number
+}
+
+export interface DocumentMergeResult extends CueMergeResult {
+  title: string
+  language: Locale
+  actors: Actor[]
+  terms: Term[]
+  snapshots: Snapshot[]
+}
+
+export interface PendingMerge extends DocumentMergeResult {
+  theirsCues: Cue[]
+  theirsRevision: number
+}
+
 export interface HistoryEntry {
   label: string
   cues: Cue[]

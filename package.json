@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc -b && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "vitest run"
   },
   "dependencies": {
     "@element-plus/icons-vue": "^2.3.1",
@@ -17,8 +18,11 @@
   "devDependencies": {
     "@types/node": "^22.13.14",
     "@vitejs/plugin-vue": "^5.2.3",
+    "fake-indexeddb": "^6.2.5",
+    "jsdom": "^29.1.1",
     "typescript": "~5.7.2",
     "vite": "^6.2.3",
+    "vitest": "^4.1.11",
     "vue-tsc": "^2.2.8"
   }
 }
